@@ -32,6 +32,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND BUILD_VIBESHINE_KWIN_GPU_BRIDGE AND
     find_package(PkgConfig REQUIRED)
     include(GNUInstallDirs)
     pkg_check_modules(LIBVIRTUALDISPLAY_KWIN_DRM REQUIRED IMPORTED_TARGET libdrm)
+    pkg_check_modules(LIBVIRTUALDISPLAY_KWIN_GBM REQUIRED IMPORTED_TARGET gbm)
 
     add_library(vibeshine_kwin_gpu SHARED
             "${LIBVIRTUALDISPLAY_LINUX_ROOT}/kwin_gpu_interposer.cpp")
@@ -40,6 +41,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND BUILD_VIBESHINE_KWIN_GPU_BRIDGE AND
     target_compile_features(vibeshine_kwin_gpu PRIVATE cxx_std_20)
     target_link_libraries(vibeshine_kwin_gpu PRIVATE
             PkgConfig::LIBVIRTUALDISPLAY_KWIN_DRM
+            PkgConfig::LIBVIRTUALDISPLAY_KWIN_GBM
             ${CMAKE_DL_LIBS})
 
     # The distro KWin binary carries cap_sys_nice, so the dynamic loader runs it
