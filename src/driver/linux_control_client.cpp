@@ -13,8 +13,8 @@
 namespace virtual_display::driver {
   namespace {
     bool valid_output_name(const std::string_view output_name) {
-      return output_name == "Virtual-1" || output_name == "Virtual-2" ||
-             output_name == "Virtual-3" || output_name == "Virtual-4";
+      return output_name.size() == 9 && output_name.starts_with("Virtual-") &&
+             output_name.back() >= '1' && output_name.back() <= '8';
     }
 
     enum class WaitResult {

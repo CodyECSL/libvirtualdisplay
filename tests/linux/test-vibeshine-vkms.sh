@@ -89,6 +89,28 @@ configure_lease_paths "$TEST_ROOT/vkms-leases"
 # shellcheck disable=SC2034
 FAKE_CONFIGFS=1
 
+[[ $VKMS_OUTPUT_COUNT -eq 8 ]] || fail "new pools must support eight client identities"
+configfs_is_mounted() { return 0; }
+OWNER_UID=11001
+OTHER_UID=11002
+
+# Upgrading the helper must not unplug a legacy pool or steal its live leases.
+VKMS_OUTPUT_COUNT=4
+create_pool || fail "legacy pool fixture creation failed"
+response=$(printf 'connect Virtual-4\n' | control_connection "$OWNER_UID") || fail "legacy ownership fixture failed"
+VKMS_OUTPUT_COUNT=8
+create_pool || fail "legacy pool upgrade validation failed"
+status_pool || fail "retained legacy pool was reported unavailable"
+assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-4/status" "$CONNECTOR_STATUS_CONNECTED"
+assert_file_value "$LEASE_ROOT/Virtual-4.owner" "$OWNER_UID"
+[[ ! -e "$VKMS_DEVICE_DIR/connectors/Virtual-5" ]] || fail "upgrade mutated the live legacy pool"
+if response=$(printf 'connect Virtual-6\n' | control_connection "$OWNER_UID"); then
+  fail "legacy pool advertised an unprovisioned output"
+fi
+[[ "$response" == "ERROR unsafe connector path" ]] || fail "unexpected legacy-capacity rejection: $response"
+remove_pool || fail "safe legacy fixture removal failed"
+[[ ! -e "$LEASE_ROOT/Virtual-4.owner" ]] || fail "legacy removal left an ownership lease"
+
 ensure_display_backend || fail "preferred backend selection failed"
 create_pool || fail "initial pool creation failed"
 assert_file_value "$VKMS_DEVICE_DIR/enabled" 1
@@ -143,7 +165,7 @@ assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-2/status" "$CONNECTOR_STA
 assert_file_value "$LEASE_PATH" "$OWNER_UID"
 validate_topology || fail "live connected topology was rejected"
 
-# A second start must retain the exact four-pipeline object graph and must not
+# A second start must retain the exact eight-pipeline object graph and must not
 # reset a live connector back to dormant.
 create_pool || fail "idempotent pool creation failed"
 assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-2/status" "$CONNECTOR_STATUS_CONNECTED"
@@ -153,7 +175,7 @@ for group in planes crtcs encoders connectors; do
     [[ -e "$entry" || -L "$entry" ]] || continue
     ((count += 1))
   done
-  [[ $count -eq $VKMS_OUTPUT_COUNT ]] || fail "${group}: expected 4 items after restart, found ${count}"
+  [[ $count -eq $VKMS_OUTPUT_COUNT ]] || fail "${group}: expected ${VKMS_OUTPUT_COUNT} items after restart, found ${count}"
 done
 
 response=$(printf 'disconnect Virtual-2\n' | control_connection 0) || fail "root handoff disconnect failed"
@@ -187,7 +209,7 @@ if response=$(printf 'status Virtual-2\n' | control_connection); then
 fi
 [[ "$response" == "ERROR peer credentials unavailable" ]] || fail "unexpected missing-peer response: ${response}"
 
-for invalid_request in 'connect Virtual-0' 'connect Virtual-5' 'connect Virtual-1 extra' 'CONNECT Virtual-1'; do
+for invalid_request in 'connect Virtual-0' 'connect Virtual-9' 'connect Virtual-01' 'status Virtual-8 extra' 'connect Virtual-1 extra' 'CONNECT Virtual-1'; do
   if response=$(printf '%s\n' "$invalid_request" | control_connection "$OWNER_UID"); then
     fail "invalid control request succeeded: ${invalid_request}"
   fi
@@ -196,6 +218,7 @@ done
 
 for invalid_mode in \
   'mode Virtual-0 3024 1890 90000' \
+  'mode Virtual-9 3024 1890 90000' \
   'mode Virtual-2 63 1890 90000' \
   'mode Virtual-2 3024 1890 0' \
   'mode Virtual-2 3024 1890 1000001'; do
@@ -209,6 +232,27 @@ if response=$(printf '%s\n' "$oversized_request" | control_connection "$OWNER_UI
   fail 'oversized control request succeeded'
 fi
 [[ "$response" == "ERROR request too large" ]] || fail "unexpected oversized-request response: ${response}"
+
+# Expanded connectors have the same peer ownership, mode and release policy.
+for connector in Virtual-5 Virtual-6 Virtual-7 Virtual-8; do
+  response=$(printf 'connect %s\n' "$connector" | control_connection "$OWNER_UID") || fail "expanded connector acquisition failed: $connector"
+  [[ "$response" == "OK connected $connector" ]] || fail "unexpected expanded connect response"
+  assert_file_value "$LEASE_ROOT/$connector.owner" "$OWNER_UID"
+  response=$(printf 'mode %s 2560 1440 120000\n' "$connector" | control_connection "$OWNER_UID") || fail "expanded connector mode request failed"
+  assert_file_value "$VKMS_DEVICE_DIR/connectors/$connector/requested_mode" "2560 1440 120000"
+  if response=$(printf 'disconnect %s\n' "$connector" | control_connection "$OTHER_UID"); then
+    fail "expanded connector accepted cross-uid disconnect"
+  fi
+  [[ "$response" == "ERROR connector owned by another uid" ]] || fail "expanded lease was not protected"
+  if response=$(printf 'mode %s 1920 1080 60000\n' "$connector" | control_connection "$OTHER_UID"); then
+    fail "expanded connector accepted cross-uid mode"
+  fi
+  assert_file_value "$VKMS_DEVICE_DIR/connectors/$connector/requested_mode" "2560 1440 120000"
+  response=$(printf 'status %s\n' "$connector" | control_connection "$OTHER_UID") || fail "expanded status request failed"
+  [[ "$response" == "STATUS connected $connector" ]] || fail "expanded connector was not reported connected"
+  response=$(printf 'disconnect %s\n' "$connector" | control_connection "$OWNER_UID") || fail "expanded owner release failed"
+  [[ ! -e "$LEASE_ROOT/$connector.owner" ]] || fail "expanded release retained a lease"
+done
 
 # Control must never follow a connector attribute symlink in the test model.
 mv -- "$VKMS_DEVICE_DIR/connectors/Virtual-3/status" "$TEST_ROOT/Virtual-3.status"

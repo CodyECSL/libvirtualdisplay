@@ -7,7 +7,7 @@ set -uo pipefail
 
 PROGRAM_NAME="vibeshine-vkms"
 VKMS_DEVICE_NAME="vibeshine"
-VKMS_OUTPUT_COUNT=4
+VKMS_OUTPUT_COUNT=8
 DRM_MODULE="vibeshine_drm"
 DRM_BACKEND="vibeshine-drm"
 CONNECTOR_STATUS_CONNECTED=1
@@ -473,6 +473,21 @@ validate_topology() {
   done
 }
 
+# Existing four-output pools may still be owned by a live compositor during a
+# package update. Validate and retain them; expand only when a new pool is made.
+existing_pool_output_count() {
+  if [[ -e "$VKMS_DEVICE_DIR/connectors/Virtual-5" || -L "$VKMS_DEVICE_DIR/connectors/Virtual-5" ]]; then
+    printf '%s\n' "$VKMS_OUTPUT_COUNT"
+  else
+    printf '4\n'
+  fi
+}
+
+validate_existing_topology() (
+  VKMS_OUTPUT_COUNT=$(existing_pool_output_count)
+  validate_topology
+)
+
 create_pipeline_items() {
   local index
 
@@ -524,16 +539,16 @@ create_pool() {
   local enabled_value
 
   if [[ -d "$VKMS_DEVICE_DIR" ]]; then
-    if validate_topology; then
+    if validate_existing_topology; then
       enabled_value=$(<"$VKMS_DEVICE_DIR/enabled")
       case "$enabled_value" in
         1)
-          log "${DRM_BACKEND} display pool is already ready (${VKMS_OUTPUT_COUNT} outputs)"
+          log "${DRM_BACKEND} display pool is already ready ($(existing_pool_output_count) outputs; retained without reprovisioning)"
           return 0
           ;;
         0)
           write_attribute "$VKMS_DEVICE_DIR/enabled" 1 || return 1
-          log "enabled existing ${DRM_BACKEND} display pool (${VKMS_OUTPUT_COUNT} outputs)"
+          log "enabled existing ${DRM_BACKEND} display pool ($(existing_pool_output_count) outputs)"
           return 0
           ;;
         *)
@@ -779,14 +794,10 @@ control_connector() {
   local caller_uid=$3
   local connector_dir status_path status_value state
 
-  case "$connector_name" in
-    Virtual-1 | Virtual-2 | Virtual-3 | Virtual-4)
-      ;;
-    *)
-      printf 'ERROR invalid connector\n'
-      return 1
-      ;;
-  esac
+  if ! resource_name_is_managed connectors "$connector_name"; then
+    printf 'ERROR invalid connector\n'
+    return 1
+  fi
 
   if ! configfs_is_mounted || ! select_control_backend; then
     printf 'ERROR display pool unavailable\n'
@@ -841,7 +852,7 @@ control_requested_mode() (
   local connector_name=$1 width=$2 height=$3 refresh=$4 caller_uid=$5
   local connector_dir mode_path status_path lock_path lock_fd owner_uid=""
 
-  if [[ ! "$connector_name" =~ ^Virtual-[1-4]$ ||
+  if [[ ! "$connector_name" =~ ^Virtual-[1-8]$ ||
         ! "$width" =~ ^[1-9][0-9]{0,3}$ || ! "$height" =~ ^[1-9][0-9]{0,3}$ ||
         ! "$refresh" =~ ^[1-9][0-9]{0,6}$ ]] ||
      ((width < 64 || width > 8192 || height < 64 || height > 8192 ||
@@ -917,22 +928,17 @@ control_connection() {
     return 1
   fi
 
-  if [[ "$request" =~ ^mode\ (Virtual-[1-4])\ ([1-9][0-9]{0,3})\ ([1-9][0-9]{0,3})\ ([1-9][0-9]{0,6})$ ]]; then
+  if [[ "$request" =~ ^mode\ (Virtual-[1-8])\ ([1-9][0-9]{0,3})\ ([1-9][0-9]{0,3})\ ([1-9][0-9]{0,6})$ ]]; then
     control_requested_mode "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" \
       "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "$caller_uid"
     return
   fi
-  case "$request" in
-    "connect Virtual-1" | "connect Virtual-2" | "connect Virtual-3" | "connect Virtual-4" | \
-    "disconnect Virtual-1" | "disconnect Virtual-2" | "disconnect Virtual-3" | "disconnect Virtual-4" | \
-    "status Virtual-1" | "status Virtual-2" | "status Virtual-3" | "status Virtual-4")
-      control_connector "${request%% *}" "${request#* }" "$caller_uid"
-      ;;
-    *)
-      printf 'ERROR malformed request\n'
-      return 1
-      ;;
-  esac
+  if [[ "$request" =~ ^(connect|disconnect|status)\ (Virtual-[1-8])$ ]]; then
+    control_connector "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$caller_uid"
+  else
+    printf 'ERROR malformed request\n'
+    return 1
+  fi
 }
 
 status_pool() {
@@ -940,9 +946,9 @@ status_pool() {
     log "private VKMS display pool is not present"
     return 3
   fi
-  validate_topology || return 1
+  validate_existing_topology || return 1
   attribute_equals "$VKMS_DEVICE_DIR/enabled" 1 || return 3
-  log "${DRM_BACKEND} display pool is ready (${VKMS_OUTPUT_COUNT} outputs)"
+  log "${DRM_BACKEND} display pool is ready ($(existing_pool_output_count) outputs)"
 }
 
 usage() {
