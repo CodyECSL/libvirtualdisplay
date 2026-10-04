@@ -282,7 +282,9 @@ static int vkms_prepare_fb(struct drm_plane *plane,
 	 * product path disables CRC and writeback for these pass-through buffers.
 	 */
 	vkms_state->frame_mapped = false;
-	if (fb->modifier != DRM_FORMAT_MOD_LINEAR)
+	/* Imported implicit storage may be tiled despite AddFB2's zero modifier. */
+	if (fb->modifier != DRM_FORMAT_MOD_LINEAR ||
+	    vkms_framebuffer_has_implicit_import(fb))
 		return 0;
 
 	ret = drm_gem_fb_vmap(fb, shadow_plane_state->map,

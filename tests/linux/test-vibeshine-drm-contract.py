@@ -150,7 +150,7 @@ def validate_frame_export(driver_root: Path) -> None:
     """Exercise the actual export helper with kernel ownership APIs stubbed."""
     driver = (driver_root / "vkms_drv.c").read_text(encoding="utf-8")
     start = driver.index("static struct dma_buf *vkms_get_frame_dmabuf(")
-    end = driver.index("static int vkms_get_frame_ioctl(", start)
+    end = driver.index("bool vkms_framebuffer_has_implicit_import(", start)
     helper = driver[start:end]
     source = r"""
 #include <assert.h>
@@ -225,6 +225,72 @@ int main(void) {
     with tempfile.TemporaryDirectory(prefix="vibeshine-drm-export-") as temporary_dir:
         source_path = Path(temporary_dir) / "frame-export.c"
         binary_path = Path(temporary_dir) / "frame-export"
+        source_path.write_text(source, encoding="utf-8")
+        subprocess.run(
+            [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
+             str(source_path), "-o", str(binary_path)], check=True,
+        )
+        subprocess.run([str(binary_path)], check=True)
+
+
+def validate_implicit_frame_layout(driver_root: Path) -> None:
+    """Exercise layout provenance for native, explicit and implicit PRIME frames."""
+    driver = (driver_root / "vkms_drv.c").read_text(encoding="utf-8")
+    start = driver.index("bool vkms_framebuffer_has_implicit_import(")
+    end = driver.index("static int vkms_get_frame_ioctl(", start)
+    source = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <libdrm/drm_fourcc.h>
+#include <libdrm/drm_mode.h>
+typedef uint64_t u64;
+struct drm_format_info { unsigned int num_planes; };
+struct drm_gem_object { void *import_attach; };
+struct drm_framebuffer {
+    unsigned int flags;
+    u64 modifier;
+    const struct drm_format_info *format;
+    struct drm_gem_object *obj[4];
+};
+static struct drm_gem_object *drm_gem_fb_get_obj(struct drm_framebuffer *fb, unsigned int plane) {
+    return fb->obj[plane];
+}
+""" + driver[start:end] + r"""
+int main(void) {
+    struct drm_format_info format = {1};
+    struct drm_gem_object native = {NULL};
+    struct drm_gem_object imported = {&format};
+    struct drm_framebuffer fb = {0, DRM_FORMAT_MOD_LINEAR, &format, {&native}};
+    const u64 tiled = DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 0);
+    assert(!vkms_framebuffer_has_implicit_import(&fb));
+    assert(vkms_framebuffer_modifier(&fb) == DRM_FORMAT_MOD_LINEAR);
+    fb.obj[0] = &imported;
+    assert(vkms_framebuffer_has_implicit_import(&fb));
+    assert(vkms_framebuffer_modifier(&fb) == DRM_FORMAT_MOD_INVALID);
+    fb.flags = DRM_MODE_FB_MODIFIERS;
+    assert(!vkms_framebuffer_has_implicit_import(&fb));
+    assert(vkms_framebuffer_modifier(&fb) == DRM_FORMAT_MOD_LINEAR);
+    fb.modifier = tiled;
+    assert(!vkms_framebuffer_has_implicit_import(&fb));
+    assert(vkms_framebuffer_modifier(&fb) == tiled);
+    fb.flags = 0;
+    fb.modifier = DRM_FORMAT_MOD_LINEAR;
+    fb.obj[0] = &native;
+    fb.obj[1] = &imported;
+    format.num_planes = 2;
+    assert(vkms_framebuffer_has_implicit_import(&fb));
+    assert(vkms_framebuffer_modifier(&fb) == DRM_FORMAT_MOD_INVALID);
+    fb.obj[1] = &native;
+    assert(!vkms_framebuffer_has_implicit_import(&fb));
+    assert(vkms_framebuffer_modifier(&fb) == DRM_FORMAT_MOD_LINEAR);
+    return 0;
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="vibeshine-drm-layout-") as temporary_dir:
+        source_path = Path(temporary_dir) / "frame-layout.c"
+        binary_path = Path(temporary_dir) / "frame-layout"
         source_path.write_text(source, encoding="utf-8")
         subprocess.run(
             [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
@@ -685,6 +751,7 @@ def main() -> int:
     validate_uapi_layout(driver_root)
     validate_requested_mode_policy(driver_root)
     validate_frame_export(driver_root)
+    validate_implicit_frame_layout(driver_root)
     validate_scanout_negotiation(driver_root)
     validate_vrr_schedule(driver_root)
     print("Vibeshine DRM source and HDR EDID contract: PASS")

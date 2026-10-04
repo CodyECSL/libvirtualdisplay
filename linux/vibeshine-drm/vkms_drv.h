@@ -341,6 +341,9 @@ struct vkms_output *vkms_crtc_init(struct drm_device *dev,
 				   struct drm_plane *cursor);
 void vkms_crtc_release_presented_frame(struct vkms_output *output);
 
+bool vkms_framebuffer_has_implicit_import(struct drm_framebuffer *fb);
+u64 vkms_framebuffer_modifier(struct drm_framebuffer *fb);
+
 /**
  * vkms_output_init() - Initialize all sub-components needed for a VKMS device.
  *

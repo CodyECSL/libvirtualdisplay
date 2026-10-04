@@ -321,6 +321,28 @@ static struct dma_buf *vkms_get_frame_dmabuf(struct drm_file *file_priv,
 	return dma_buf;
 }
 
+bool vkms_framebuffer_has_implicit_import(struct drm_framebuffer *fb)
+{
+	unsigned int i;
+
+	if (fb->flags & DRM_MODE_FB_MODIFIERS)
+		return false;
+	for (i = 0; i < fb->format->num_planes; ++i) {
+		struct drm_gem_object *obj = drm_gem_fb_get_obj(fb, i);
+
+		if (obj && obj->import_attach)
+			return true;
+	}
+	return false;
+}
+
+u64 vkms_framebuffer_modifier(struct drm_framebuffer *fb)
+{
+	/* Plain AddFB2's zero modifier does not describe imported storage. */
+	return vkms_framebuffer_has_implicit_import(fb) ?
+		DRM_FORMAT_MOD_INVALID : fb->modifier;
+}
+
 static int vkms_get_frame_ioctl(struct drm_device *dev, void *data,
 				struct drm_file *file_priv)
 {
@@ -365,7 +387,7 @@ static int vkms_get_frame_ioctl(struct drm_device *dev, void *data,
 	request->width = fb->width;
 	request->height = fb->height;
 	request->fourcc = fb->format->format;
-	request->modifier = fb->modifier;
+	request->modifier = vkms_framebuffer_modifier(fb);
 	plane_count = fb->format->num_planes;
 	if (!plane_count || plane_count > VIBESHINE_DRM_FRAME_MAX_PLANES) {
 		ret = -EINVAL;

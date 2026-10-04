@@ -94,7 +94,8 @@ struct vibeshine_drm_wait_present {
  * @width: out: framebuffer width in pixels
  * @height: out: framebuffer height in pixels
  * @fourcc: out: DRM framebuffer format
- * @modifier: out: DRM framebuffer modifier
+ * @modifier: out: DRM framebuffer modifier, or DRM_FORMAT_MOD_INVALID for
+ *            imported PRIME storage created without an explicit modifier
  * @plane_count: out: number of valid entries in the per-plane arrays
  * @dma_buf_fds: out: close-on-exec DMA-BUF descriptors owned by the caller
  * @pitches: out: DRM framebuffer pitches

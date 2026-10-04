@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
@@ -39,16 +38,15 @@ def main() -> int:
     cmake = cmake_path.read_text(encoding="utf-8")
 
     require_all(interposer, (
-        'extern "C" int drmGetDevices2',
-        'extern "C" int drmGetDevice2',
-        'extern "C" int drmGetDeviceFromDevId',
+        'extern "C" gbm_device *gbm_create_device',
+        'extern "C" void gbm_device_destroy',
         "DRM_BUS_FAUX",
         'std::strcmp(device->businfo.faux->name, "vibeshine")',
         "deviceinfo.pci->vendor_id == 0x10de",
         "matches > 1",
         "VIBESHINE_KWIN_RENDER_PCI",
         "vibeshine_kwin_gpu_interposer_abi",
-        "return 4",
+        "return 5",
         "stop_kwin_preload_inheritance",
         "running_inside_kwin",
         "hooks_enabled.store(true, std::memory_order_release)",
@@ -56,37 +54,23 @@ def main() -> int:
         '"/usr/bin/kwin_wayland"',
         'unsetenv("LD_PRELOAD")',
     ), interposer_path.name)
-    for function_name in ("drmGetDevice2", "drmGetDeviceFromDevId"):
-        require(
-            re.search(
-                rf'extern "C" int {function_name}\(.*?'
-                r"attach_vibeshine_display_to_nvidia\(\*device\);",
-                interposer,
-                flags=re.DOTALL,
-            )
-            is not None,
-            f"{function_name} does not normalize the per-device Vibeshine identity",
-        )
+    require('extern "C" int drmGet' not in interposer,
+            "bridge must not rewrite libdrm device identities")
+    require("bustype = DRM_BUS_PCI" not in interposer,
+            "virtual KMS PCI spoofing returned")
+    require_all(interposer, (
+        "hooks_enabled.load(std::memory_order_acquire)",
+        "drmGetNodeTypeFromFd(fd) == DRM_NODE_RENDER",
+        "pci_matches(*opened->businfo.pci, identity)",
+        "owned_render_fds.emplace(allocator, render_fd)",
+    ), interposer_path.name)
     require("drmIoctl" not in interposer, "physical-connector DRM ioctl suppression returned")
     require("HEADLESS_HDR" not in interposer, "physical headless-HDR policy returned")
 
-    # Every libdrm hook must stay inert outside the compositor: the library is
-    # trusted by the secure-mode loader and could be preloaded into any
-    # set-user-ID program.
-    for function_name in ("drmGetDevices2", "drmGetDevice2", "drmGetDeviceFromDevId"):
-        require(
-            re.search(
-                rf'extern "C" int {function_name}\(.*?'
-                r"hooks_enabled\.load\(std::memory_order_acquire\)",
-                interposer,
-                flags=re.DOTALL,
-            )
-            is not None,
-            f"{function_name} rewrites device identity outside KWin",
-        )
     require_all(dropin, (
         "Environment=LD_PRELOAD=@VIBESHINE_KWIN_GPU_LIBRARY_NAME@",
         "Environment=VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE=1",
+        "Environment=KWIN_DISABLE_UDMABUF_IMPORT=1",
     ), dropin_path.name)
     require("LD_PRELOAD=/" not in dropin and "LIBRARY_PATH@" not in dropin,
             "desktop drop-in preloads by path, which the secure-mode loader ignores")
@@ -96,6 +80,7 @@ def main() -> int:
         "UnsetEnvironment=LD_AUDIT",
         "Environment=LD_PRELOAD=@VIBESHINE_KWIN_GPU_LIBRARY_NAME@",
         "Environment=VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE=1",
+        "Environment=KWIN_DISABLE_UDMABUF_IMPORT=1",
     ), login_dropin_path.name)
     require("ExecStart=" not in login_dropin, "login drop-in replaces the vendor KWin command")
     require("BUILD_VIBESHINE_KWIN_GPU_BRIDGE" in cmake,

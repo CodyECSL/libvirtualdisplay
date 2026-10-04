@@ -5,3 +5,6 @@
 UnsetEnvironment=LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PROFILE LD_SHOW_AUXV
 Environment=LD_PRELOAD=@VIBESHINE_KWIN_GPU_LIBRARY_NAME@
 Environment=VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE=1
+# The faux KMS identity cannot expose NVIDIA's SHM/udmabuf import limitation.
+# KWin reads this before GBM routing; SHM retains its CPU upload fallback.
+Environment=KWIN_DISABLE_UDMABUF_IMPORT=1

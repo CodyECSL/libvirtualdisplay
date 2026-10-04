@@ -44,6 +44,14 @@ add_test(NAME driver_inf_in_sync
             "${PROJECT_SOURCE_DIR}/src/driver/windows_driver/SunshineVirtualDisplayDriver.inf")
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(TARGET vibeshine_kwin_gpu)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(LIBVIRTUALDISPLAY_TEST_KWIN REQUIRED IMPORTED_TARGET libdrm gbm)
+        add_executable(test_kwin_gpu_routing "${PROJECT_SOURCE_DIR}/tests/linux/test-kwin-gpu-routing.cpp")
+        target_link_libraries(test_kwin_gpu_routing PRIVATE
+                PkgConfig::LIBVIRTUALDISPLAY_TEST_KWIN ${CMAKE_DL_LIBS})
+        add_test(NAME linux_kwin_gpu_routing COMMAND test_kwin_gpu_routing)
+    endif()
     find_program(LIBVIRTUALDISPLAY_BASH_EXECUTABLE bash)
     if(LIBVIRTUALDISPLAY_BASH_EXECUTABLE)
         add_test(NAME linux_vkms_setup
