@@ -2,8 +2,11 @@
 
 #if defined(__linux__)
 
+#include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cstring>
+#include <limits>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -13,8 +16,21 @@
 namespace virtual_display::driver {
   namespace {
     bool valid_output_name(const std::string_view output_name) {
-      return output_name.size() == 9 && output_name.starts_with("Virtual-") &&
-             output_name.back() >= '1' && output_name.back() <= '8';
+      constexpr std::string_view prefix = "Virtual-";
+      if (!output_name.starts_with(prefix) || output_name.size() <= prefix.size()) {
+        return false;
+      }
+      const auto suffix = output_name.substr(prefix.size());
+      if (suffix.size() > 10 || suffix.front() < '1' || suffix.front() > '9' ||
+          !std::all_of(suffix.begin(), suffix.end(), [](const char digit) {
+            return digit >= '0' && digit <= '9';
+          })) {
+        return false;
+      }
+      int connector_type_id = 0;
+      const auto [end, error] = std::from_chars(suffix.data(), suffix.data() + suffix.size(), connector_type_id);
+      return error == std::errc {} && end == suffix.data() + suffix.size() &&
+             connector_type_id > 0 && connector_type_id <= std::numeric_limits<int>::max();
     }
 
     enum class WaitResult {

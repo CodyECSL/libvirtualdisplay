@@ -24,6 +24,15 @@ monitor contract:
 - an independent `/sys/kernel/config/vibeshine-drm` configfs namespace, so the
   driver can coexist with a distribution's normal `vkms` module.
 
+Each connector's configfs `drm_name` attribute is read-only and reports the
+instantiated DRM connector name. DRM virtual connector type IDs are global
+across DRM devices, while configfs `Virtual-N` names identify pool-local slots.
+The broker resolves public DRM names through `drm_name` before changing status,
+requested modes, or leases; it fails closed if the loaded module lacks this
+attribute or if the mapping is missing or ambiguous. Updating the driver source
+does not update an already-loaded module; the new attribute becomes available
+after the updated driver is loaded, which may require a reboot.
+
 ## Presentation and frame-export ABI
 
 `vibeshine_drm_uapi.h` defines `DRM_VIBESHINE_WAIT_PRESENT`. Each CRTC owns a

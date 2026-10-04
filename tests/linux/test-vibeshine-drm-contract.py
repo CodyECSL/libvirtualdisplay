@@ -713,6 +713,8 @@ def validate_source_contract(driver_root: Path) -> None:
     require_source(configfs, "if (writeback)", configfs_path.name)
     require_source(configfs, "return -EOPNOTSUPP", configfs_path.name)
     require_source(configfs, "CONFIGFS_ATTR(connector_, requested_mode)", configfs_path.name)
+    require_source(configfs, "CONFIGFS_ATTR_RO(connector_, drm_name)", configfs_path.name)
+    require_source(configfs, "connector->config->connector->base.name", configfs_path.name)
     require_source(configfs, "vkms_trigger_connector_hotplug", configfs_path.name)
 
     require(re.search(r'\.ci_name\s*=\s*"vibeshine-drm"', configfs) is not None,

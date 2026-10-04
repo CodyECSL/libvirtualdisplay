@@ -15,7 +15,9 @@
 namespace virtual_display::driver {
   TEST(LinuxControlClient, RejectsUnknownConnectorBeforeTransport) {
     LinuxControlClient client {"/tmp/libvirtualdisplay-unused.sock", std::chrono::milliseconds {10}};
-    for (const auto &name : {"Virtual-0", "Virtual-9", "Virtual-01", "Virtual-8 extra", "Virtual-../8"}) {
+    for (const auto &name : {
+           "Virtual-0", "Virtual-01", "Virtual-2147483648", "Virtual-8 extra", "Virtual-../8"
+         }) {
       const auto result = client.query_connector(name);
       EXPECT_EQ(result.status, LinuxControlStatus::InvalidRequest) << name;
       EXPECT_FALSE(result.connected.has_value());
@@ -52,19 +54,19 @@ namespace virtual_display::driver {
       const auto count = recv(connection, buffer, sizeof(buffer), 0);
       if (count > 0) {
         request.assign(buffer, static_cast<std::size_t>(count));
-        const std::string reply = "STATUS disconnected Virtual-8\n";
+        const std::string reply = "STATUS disconnected Virtual-9\n";
         (void) send(connection, reply.data(), reply.size(), MSG_NOSIGNAL);
       }
       close(connection);
     }};
 
     LinuxControlClient client {socket_path, std::chrono::seconds {1}};
-    const auto result = client.query_connector("Virtual-8");
+    const auto result = client.query_connector("Virtual-9");
     broker.join();
     close(listener);
     unlink(socket_path.c_str());
 
-    EXPECT_EQ(request, "status Virtual-8\n");
+    EXPECT_EQ(request, "status Virtual-9\n");
     ASSERT_TRUE(result.ok()) << result.detail;
     ASSERT_TRUE(result.connected.has_value());
     EXPECT_FALSE(*result.connected);

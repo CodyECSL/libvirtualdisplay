@@ -190,6 +190,7 @@ create_configfs_item() {
       connector)
         mkdir -- "$path/possible_encoders" || return 1
         : >"$path/status" || return 1
+        printf '%s\n' "${path##*/}" >"$path/drm_name" || return 1
         printf '0 0 0\n' >"$path/requested_mode" || return 1
         ;;
       *)
@@ -233,6 +234,47 @@ resource_name_is_managed() {
     esac
   done
   return 1
+}
+
+public_connector_name_is_valid() {
+  local name=$1
+  local suffix
+
+  [[ "$name" =~ ^Virtual-([1-9][0-9]{0,9})$ ]] || return 1
+  suffix=${BASH_REMATCH[1]}
+  ((10#$suffix <= 2147483647))
+}
+
+resolve_public_connector() {
+  local public_name=$1
+  local output_variable=$2
+  local index connector_dir drm_name match=""
+
+  printf -v "$output_variable" '%s' ""
+  public_connector_name_is_valid "$public_name" || return 1
+
+  # DRM connector type IDs are global across devices. Resolve the KScreen name
+  # through the driver's read-only configfs attribute; never infer an offset or
+  # use an external name as a configfs path or lease key.
+  for ((index = 1; index <= VKMS_OUTPUT_COUNT; ++index)); do
+    connector_dir="$VKMS_DEVICE_DIR/connectors/Virtual-${index}"
+    [[ -d "$connector_dir" && ! -L "$connector_dir" ]] || continue
+    if [[ ! -f "$connector_dir/drm_name" || -L "$connector_dir/drm_name" ]]; then
+      error "connector DRM-name mapping is unavailable: ${connector_dir}"
+      return 2
+    fi
+    drm_name=$(<"$connector_dir/drm_name")
+    if [[ "$drm_name" == "$public_name" ]]; then
+      if [[ -n "$match" ]]; then
+        error "connector DRM-name mapping is ambiguous: ${public_name}"
+        return 2
+      fi
+      match="Virtual-${index}"
+    fi
+  done
+
+  [[ -n "$match" ]] || return 1
+  printf -v "$output_variable" '%s' "$match"
 }
 
 link_directory_is_managed() {
@@ -332,6 +374,7 @@ prepare_fake_item_for_removal() {
       ;;
     connector)
       rm -f -- "$path/status"
+      rm -f -- "$path/drm_name"
       rm -f -- "$path/requested_mode"
       rmdir -- "$path/possible_encoders" 2>/dev/null || true
       ;;
@@ -687,6 +730,7 @@ mutate_connector() (
   local connector_name=$2
   local caller_uid=$3
   local status_path=$4
+  local response_name=${5:-$connector_name}
   local lock_path owner_uid="" current_status lock_fd
 
   umask 077
@@ -737,7 +781,7 @@ mutate_connector() (
           printf 'ERROR connector owned by another uid\n'
           return 1
         fi
-        printf 'OK connected %s\n' "$connector_name"
+        printf 'OK connected %s\n' "$response_name"
         return 0
       fi
 
@@ -757,7 +801,7 @@ mutate_connector() (
         printf 'ERROR connector update failed\n'
         return 1
       fi
-      printf 'OK connected %s\n' "$connector_name"
+      printf 'OK connected %s\n' "$response_name"
       ;;
     disconnect)
       if [[ -n "$owner_uid" && "$caller_uid" != 0 && "$caller_uid" != "$owner_uid" ]]; then
@@ -779,7 +823,7 @@ mutate_connector() (
         printf 'ERROR connector lease cleanup failed\n'
         return 1
       fi
-      printf 'OK disconnected %s\n' "$connector_name"
+      printf 'OK disconnected %s\n' "$response_name"
       ;;
     *)
       printf 'ERROR invalid action\n'
@@ -790,17 +834,22 @@ mutate_connector() (
 
 control_connector() {
   local action=$1
-  local connector_name=$2
+  local public_name=$2
   local caller_uid=$3
-  local connector_dir status_path status_value state
+  local connector_name connector_dir status_path status_value state
 
-  if ! resource_name_is_managed connectors "$connector_name"; then
+  if ! public_connector_name_is_valid "$public_name"; then
     printf 'ERROR invalid connector\n'
     return 1
   fi
 
   if ! configfs_is_mounted || ! select_control_backend; then
     printf 'ERROR display pool unavailable\n'
+    return 1
+  fi
+
+  if ! resolve_public_connector "$public_name" connector_name; then
+    printf 'ERROR invalid connector\n'
     return 1
   fi
 
@@ -820,11 +869,11 @@ control_connector() {
 
   case "$action" in
     connect)
-      mutate_connector connect "$connector_name" "$caller_uid" "$status_path"
+      mutate_connector connect "$connector_name" "$caller_uid" "$status_path" "$public_name"
       return
       ;;
     disconnect)
-      mutate_connector disconnect "$connector_name" "$caller_uid" "$status_path"
+      mutate_connector disconnect "$connector_name" "$caller_uid" "$status_path" "$public_name"
       return
       ;;
     status)
@@ -837,7 +886,7 @@ control_connector() {
           return 1
           ;;
       esac
-      printf 'STATUS %s %s\n' "$state" "$connector_name"
+      printf 'STATUS %s %s\n' "$state" "$public_name"
       return 0
       ;;
     *)
@@ -849,11 +898,12 @@ control_connector() {
 }
 
 control_requested_mode() (
-  local connector_name=$1 width=$2 height=$3 refresh=$4 caller_uid=$5
+  local public_name=$1 width=$2 height=$3 refresh=$4 caller_uid=$5
+  local connector_name
   local connector_dir mode_path status_path lock_path lock_fd owner_uid=""
 
-  if [[ ! "$connector_name" =~ ^Virtual-[1-8]$ ||
-        ! "$width" =~ ^[1-9][0-9]{0,3}$ || ! "$height" =~ ^[1-9][0-9]{0,3}$ ||
+  if ! public_connector_name_is_valid "$public_name" ||
+     [[ ! "$width" =~ ^[1-9][0-9]{0,3}$ || ! "$height" =~ ^[1-9][0-9]{0,3}$ ||
         ! "$refresh" =~ ^[1-9][0-9]{0,6}$ ]] ||
      ((width < 64 || width > 8192 || height < 64 || height > 8192 ||
        refresh < 1000 || refresh > 1000000)); then
@@ -862,6 +912,11 @@ control_requested_mode() (
   fi
   if ! configfs_is_mounted || ! select_control_backend; then
     printf 'ERROR display pool unavailable\n'
+    return 1
+  fi
+
+  if ! resolve_public_connector "$public_name" connector_name; then
+    printf 'ERROR invalid connector\n'
     return 1
   fi
   connector_dir="$VKMS_DEVICE_DIR/connectors/$connector_name"
@@ -906,7 +961,7 @@ control_requested_mode() (
     printf 'ERROR requested mode update failed\n'
     return 1
   fi
-  printf 'OK mode %s %s %s %s\n' "$connector_name" "$width" "$height" "$refresh"
+  printf 'OK mode %s %s %s %s\n' "$public_name" "$width" "$height" "$refresh"
 )
 
 control_connection() {
@@ -928,12 +983,12 @@ control_connection() {
     return 1
   fi
 
-  if [[ "$request" =~ ^mode\ (Virtual-[1-8])\ ([1-9][0-9]{0,3})\ ([1-9][0-9]{0,3})\ ([1-9][0-9]{0,6})$ ]]; then
+  if [[ "$request" =~ ^mode\ (Virtual-[1-9][0-9]{0,9})\ ([1-9][0-9]{0,3})\ ([1-9][0-9]{0,3})\ ([1-9][0-9]{0,6})$ ]]; then
     control_requested_mode "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" \
       "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "$caller_uid"
     return
   fi
-  if [[ "$request" =~ ^(connect|disconnect|status)\ (Virtual-[1-8])$ ]]; then
+  if [[ "$request" =~ ^(connect|disconnect|status)\ (Virtual-[1-9][0-9]{0,9})$ ]]; then
     control_connector "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$caller_uid"
   else
     printf 'ERROR malformed request\n'
