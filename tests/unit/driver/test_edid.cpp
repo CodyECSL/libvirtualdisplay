@@ -92,6 +92,43 @@ TEST(VirtualDisplayDriverEdid, RejectsInvalidManufacturerCodes) {
   EXPECT_EQ(vdd::read_manufacturer_id(edid), std::nullopt);
 }
 
+TEST(VirtualDisplayDriverEdid, HdrAdvertisesBt2020PrimariesWithD65White) {
+  const auto edid = vdd::create_edid(default_options());
+  // EDID 1.4 stores each xy coordinate as a ten-bit fraction: eight high
+  // bits in bytes 27-34, and two low bits packed into bytes 25-26.
+  const std::array<double, 8> expected {
+    0.708, 0.292, 0.170, 0.797, 0.131, 0.046, 0.3127, 0.3290
+  };
+  const auto low_bits = (byte_value(edid[25]) << 8u) | byte_value(edid[26]);
+  for (std::size_t coordinate = 0; coordinate < expected.size(); ++coordinate) {
+    const auto high = byte_value(edid[27 + coordinate]);
+    const auto low = (low_bits >> (14u - 2u * coordinate)) & 3u;
+    EXPECT_NEAR(((high << 2u) | low) / 1024.0, expected[coordinate], 0.5 / 1024.0)
+      << "chromaticity coordinate " << coordinate;
+  }
+  EXPECT_EQ(byte_value(edid[24]) & 0x04u, 0u);  // Do not declare default sRGB.
+  EXPECT_TRUE(vdd::has_valid_edid_checksums(edid));
+  EXPECT_TRUE(vdd::has_bt2020_colorimetry(edid));
+  const auto hdr = vdd::read_hdr_static_metadata(edid);
+  ASSERT_TRUE(hdr.has_value());
+  EXPECT_NE(hdr->supported_eotfs & vdd::kHdrEotfSmpte2084, 0u);
+}
+
+TEST(VirtualDisplayDriverEdid, SdrPreservesOriginalRec709ChromaticityBytes) {
+  auto options = default_options();
+  options.hdr_supported = false;
+  const auto edid = vdd::create_edid(options);
+  const std::array<std::uint8_t, 10> original {
+    0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54
+  };
+  for (std::size_t index = 0; index < original.size(); ++index) {
+    EXPECT_EQ(byte_value(edid[25 + index]), original[index]);
+  }
+  EXPECT_TRUE(vdd::has_valid_edid_checksums(edid));
+  EXPECT_FALSE(vdd::has_hdr_static_metadata(edid));
+  EXPECT_FALSE(vdd::has_bt2020_colorimetry(edid));
+}
+
 TEST(VirtualDisplayDriverEdid, StopsMonitorNameAtDescriptorTerminator) {
   auto edid = vdd::create_edid(default_options());
   edid[90 + 5 + 4] = std::byte {'\n'};
