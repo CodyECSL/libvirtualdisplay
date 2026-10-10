@@ -61,10 +61,9 @@ atomic quiesce after userspace has exited but before physical GPU devices shut
 down. This two-phase ordering prevents both a live-compositor unplug and stale
 imported DMA-BUF references crossing into NVIDIA teardown.
 
-The restart bugcheck and power-off deadline are registered once for the loaded
-module, not per virtual device, so they still apply after a deploy or configfs
-teardown has removed every device. That module notifier runs before the
-per-device releases.
+Restart, power-off, and halt all use this per-device cleanup before continuing
+the kernel's normal shutdown sequence. The driver does not force a kernel panic
+or impose a shutdown deadline.
 
 The managed configfs pool provisions exactly one primary plane per CRTC. It
 does not create cursor or overlay planes, forcing KWin to composite the cursor,

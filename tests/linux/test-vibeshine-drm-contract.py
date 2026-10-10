@@ -399,6 +399,55 @@ int main(void) {
         subprocess.run([str(binary_path)], check=True)
 
 
+def validate_reboot_notifier(driver_root: Path) -> None:
+    """Every shutdown action must release the device and continue normally."""
+    driver = (driver_root / "vkms_drv.c").read_text(encoding="utf-8")
+    start = driver.index("static int vkms_reboot_notifier(")
+    end = driver.index("int vkms_create(", start)
+    source = r"""
+#include <assert.h>
+#include <stddef.h>
+#define SYS_RESTART 1
+#define SYS_HALT 2
+#define SYS_POWER_OFF 3
+#define NOTIFY_DONE 0
+#define DRM_INFO(...) ((void)0)
+#define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
+struct notifier_block { int unused; };
+struct vkms_device { int unused; struct notifier_block reboot_notifier; };
+static struct vkms_device *released;
+static unsigned int release_count;
+static void vkms_shutdown_release(struct vkms_device *device) {
+    released = device;
+    ++release_count;
+}
+""" + driver[start:end] + r"""
+int main(void) {
+    struct vkms_device devices[2] = {0};
+    const unsigned long actions[] = {SYS_RESTART, SYS_HALT, SYS_POWER_OFF};
+    for (unsigned int i = 0; i < sizeof(actions) / sizeof(actions[0]); ++i) {
+        for (unsigned int j = 0; j < 2; ++j) {
+            released = NULL;
+            release_count = 0;
+            assert(vkms_reboot_notifier(&devices[j].reboot_notifier,
+                                       actions[i], NULL) == NOTIFY_DONE);
+            assert(released == &devices[j] && release_count == 1);
+        }
+    }
+    return 0;
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="vibeshine-drm-reboot-") as temporary_dir:
+        source_path = Path(temporary_dir) / "reboot-notifier.c"
+        binary_path = Path(temporary_dir) / "reboot-notifier"
+        source_path.write_text(source, encoding="utf-8")
+        subprocess.run(
+            [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
+             str(source_path), "-o", str(binary_path)], check=True,
+        )
+        subprocess.run([str(binary_path)], check=True)
+
+
 def validate_source_contract(driver_root: Path) -> None:
     compat_path = driver_root / "vibeshine_drm_compat.h"
     connector_path = driver_root / "vkms_connector.c"
@@ -563,12 +612,6 @@ def validate_source_contract(driver_root: Path) -> None:
         "quiesce_store",
         "vkms_crtc_release_presented_frame",
         "vkms_device->drm.max_vblank_count = U32_MAX",
-        "#define VKMS_POWEROFF_DEADLINE_SECS 5U",
-        "static void __noreturn vkms_bugcheck(const char *reason)",
-        "if (panic_timeout == 0)\n\t\tpanic_timeout = -1;",
-        'panic("vibeshine_drm: %s\\n", reason);',
-        "static DEFINE_TIMER(vkms_shutdown_deadline_timer, vkms_shutdown_deadline_expired);",
-        "timer_shutdown_sync(&vkms_shutdown_deadline_timer);",
     ):
         require_source(drv, needle, drv_path.name)
     require("vkms_wait_for_vrr_presentation_slot" not in drv and
@@ -583,40 +626,13 @@ def validate_source_contract(driver_root: Path) -> None:
             tail.index("drm_atomic_helper_commit_hw_done(old_state)") <
             tail.index("drm_atomic_helper_cleanup_planes(dev, old_state)"),
             "publication must follow flip completion before releasing later commits and buffers")
-    require("module_param_named(shutdown_deadline_secs" not in drv,
-            "the restart bugcheck must not be optional")
-    # The restart bugcheck and power-off deadline must outlive every virtual
-    # device: a per-device notifier vanishes with the pool, and a restart then
-    # walks into the physical GPU's shutdown callback.
-    require_source(drv, "static int vkms_module_reboot_notifier(", drv_path.name)
-    module_start = drv.index("static int vkms_module_reboot_notifier(")
-    module_notifier = drv[module_start:drv.index("return NOTIFY_DONE;", module_start)]
-    restart_check = module_notifier.find("if (action == SYS_RESTART)\n\t\tvkms_bugcheck(")
-    require(restart_check >= 0, "a restart does not bugcheck immediately in the module reboot notifier")
-    require(restart_check < module_notifier.index("vkms_arm_shutdown_deadline();"),
-            "power-off does not arm the bugcheck deadline in the module reboot notifier")
-    nb_start = drv.index("static struct notifier_block vkms_module_reboot_nb = {")
-    require(".priority = 1," in drv[nb_start:drv.index("};", nb_start)],
-            "the module reboot notifier does not run before per-device releases")
-    device_start = drv.index("static int vkms_reboot_notifier(")
-    device_notifier = drv[device_start:drv.index("int vkms_create(", device_start)]
-    require("vkms_bugcheck(" not in device_notifier and "vkms_arm_shutdown_deadline" not in device_notifier,
-            "a per-device reboot notifier still owns the bugcheck or deadline")
-    require(device_notifier.index("if (action == SYS_RESTART)\n\t\treturn NOTIFY_DONE;") <
-            device_notifier.index("vkms_shutdown_release(vkmsdev);"),
-            "a restart still releases devices after the module notifier bugchecked")
-    init_body = drv[drv.index("static int __init vkms_init(void)"):drv.index("void vkms_destroy(")]
-    require(init_body.index("register_reboot_notifier(&vkms_module_reboot_nb)") <
-            init_body.index("vkms_configfs_register()"),
-            "the module reboot notifier is not registered before any device can exist")
-    require("unregister_reboot_notifier(&vkms_module_reboot_nb);" in init_body,
-            "failed module initialization leaves the reboot notifier registered")
-    exit_body = drv[drv.index("static void __exit vkms_exit(void)"):drv.index("module_init(vkms_init);")]
-    require("timer_shutdown_sync(&vkms_shutdown_deadline_timer);" in exit_body,
-            "module exit does not shut the bugcheck deadline timer down")
-    require(exit_body.index("unregister_reboot_notifier(&vkms_module_reboot_nb);") <
-            exit_body.index("timer_shutdown_sync(&vkms_shutdown_deadline_timer);"),
-            "module exit can re-arm the deadline after shutting its timer down")
+    for obsolete in (
+        "vkms_bugcheck", "panic_timeout", "VKMS_POWEROFF_DEADLINE_SECS",
+        "shutdown_deadline", "vkms_module_reboot_", "<linux/panic.h>", "<linux/timer.h>",
+    ):
+        require(obsolete not in drv, f"obsolete forced-shutdown machinery remains: {obsolete}")
+    require(re.search(r"\b(?:panic|emergency_restart|kernel_restart)\s*\(", drv) is None,
+            "the display driver still forces a system panic or restart")
     require(
         drv.index("vkms_device->drm.max_vblank_count = U32_MAX") <
         drv.index("drm_vblank_init(&vkms_device->drm"),
@@ -682,6 +698,7 @@ def main() -> int:
         validate_edid(binary.read_bytes())
 
     validate_source_contract(driver_root)
+    validate_reboot_notifier(driver_root)
     validate_uapi_layout(driver_root)
     validate_requested_mode_policy(driver_root)
     validate_frame_export(driver_root)
