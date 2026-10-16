@@ -201,13 +201,38 @@ namespace {
     return std::strcmp(executable.data(), "/usr/bin/kwin_wayland") == 0;
   }
 
+  /**
+   * @brief Enable render-node substitution only for KWin's legacy allocator.
+   *
+   * KWin 6.8 separates rendering from scanout and sends software scanout
+   * allocations through gbm_device_get_fd(). Replacing that KMS device with
+   * an NVIDIA render node makes CREATE_DUMB fail in drm_ioctl_permit().
+   * Detect the exported allocator ABI rather than a package/version string;
+   * unknown ABIs also retain the compositor's native allocation path.
+   *
+   * @param lookup Dynamic symbol lookup, injectable for routing tests.
+   */
+  void configure_allocator_routing(void *(*lookup)(void *, const char *)) {
+    const bool legacy_allocator = lookup(RTLD_DEFAULT,
+      "_ZN4KWin26GbmGraphicsBufferAllocatorC1EP10gbm_devicem") != nullptr;
+    const bool native_allocator = lookup(RTLD_DEFAULT,
+      "_ZN4KWin26GbmGraphicsBufferAllocatorC1EPNS_9DrmDeviceE") != nullptr;
+    hooks_enabled.store(legacy_allocator && !native_allocator, std::memory_order_release);
+    // Always clear the preload, including when the native KMS allocator wins.
+    (void)unsetenv("LD_PRELOAD");
+    (void)unsetenv(kPreloadActiveEnvironment.data());
+    if (!legacy_allocator || native_allocator) {
+      constexpr char message[] =
+        "[vibeshine-kwin-gpu] preserving native KMS allocator for current KWin ABI\n";
+      (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+    }
+  }
+
   __attribute__((constructor)) void stop_kwin_preload_inheritance() {
     if (!std::getenv(kPreloadActiveEnvironment.data()) || !running_inside_kwin()) {
       return;
     }
-    hooks_enabled.store(true, std::memory_order_release);
-    (void)unsetenv("LD_PRELOAD");
-    (void)unsetenv(kPreloadActiveEnvironment.data());
+    configure_allocator_routing(dlsym);
   }
 }
 

@@ -5,11 +5,22 @@ desktop and login compositors. Only `/usr/bin/kwin_wayland` enables its hooks;
 other processes pass through unchanged and compositor children do not inherit
 the preload.
 
-The bridge gives a Vibeshine faux KMS device a GBM allocator opened on a real
+For KWin's recognized legacy GBM allocator ABI (including KWin 6.7), the
+bridge gives a Vibeshine faux KMS device a GBM allocator opened on a real
 NVIDIA render node. The original KMS fd remains the output's scanout endpoint.
 Physical DRM devices, libdrm identities and enumeration order are unchanged.
 KWin and EGL use their normal per-output GPU import path. This also avoids advertising the virtual card as a second copy of an
 NVIDIA PCI device to unrelated GBM/EGL consumers inside the compositor.
+
+KWin 6.8 separates render allocation from KMS scanout allocation. Its software
+scanout path calls `CREATE_DUMB` on `gbm_device_get_fd()`, which must remain the
+virtual KMS fd: Linux rejects this ioctl on an NVIDIA render node with `EACCES`.
+The bridge recognizes the exported `DrmDevice *` allocator constructor and
+preserves native allocation for that ABI and for unrecognized ABIs. It still
+removes the preload environment before compositor children start. Physical
+GPU allocators and DRM permissions are unchanged. A running compositor must
+restart through the normal logout/reboot cycle to load an updated bridge;
+restarting the streaming service does not replace its already loaded library.
 
 KWin still chooses its primary GPU using its own renderer/output policy;
 accelerating the faux renderer can change that choice.

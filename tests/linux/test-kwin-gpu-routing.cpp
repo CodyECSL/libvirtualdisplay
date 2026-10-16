@@ -75,6 +75,20 @@ namespace {
   int last_node_fd;
   bool reject_render_gbm;
   bool reject_render_type;
+  bool legacy_allocator_symbol;
+  bool native_allocator_symbol;
+
+  void *lookup_allocator(void *scope, const char *name) {
+    require(scope == RTLD_DEFAULT, "allocator lookup used a different symbol scope");
+    static int symbol;
+    if (std::strcmp(name, "_ZN4KWin26GbmGraphicsBufferAllocatorC1EP10gbm_devicem") == 0) {
+      return legacy_allocator_symbol ? &symbol : nullptr;
+    }
+    if (std::strcmp(name, "_ZN4KWin26GbmGraphicsBufferAllocatorC1EPNS_9DrmDeviceE") == 0) {
+      return native_allocator_symbol ? &symbol : nullptr;
+    }
+    throw std::runtime_error("unexpected KWin ABI lookup");
+  }
 
   int get_devices(std::uint32_t, drmDevicePtr devices[], int capacity) {
     ++enumerations;
@@ -133,6 +147,7 @@ namespace {
     last_node_fd = -1;
     renumbered_device = nullptr;
     reject_render_gbm = reject_render_type = false;
+    legacy_allocator_symbol = native_allocator_symbol = false;
     unsetenv("VIBESHINE_KWIN_RENDER_PCI");
   }
 
@@ -231,6 +246,38 @@ int main() {
       gbm_device_destroy(device);
       require(fcntl(virtio.fd, F_GETFD) >= 0, "caller-owned console fd was closed");
       require_original_devices();
+    });
+    run("recognized legacy allocator retains NVIDIA routing", [&] {
+      legacy_allocator_symbol = true;
+      configure_allocator_routing(lookup_allocator);
+      require(hooks_enabled, "legacy KWin lost its virtual rendering bridge");
+      require_routed(gbm_create_device(virtual_kms.fd), nvidia_one);
+    });
+    run("KWin 6.8 scanout allocator keeps the KMS fd for dumb buffers", [&] {
+      native_allocator_symbol = true;
+      setenv("VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE", "1", 1);
+      setenv("LD_PRELOAD", "libvibeshine-kwin-gpu.so", 1);
+      configure_allocator_routing(lookup_allocator);
+      require(!hooks_enabled, "native scanout allocator was routed to a render node");
+      require(!std::getenv("LD_PRELOAD") && !std::getenv("VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE"),
+        "native allocator path leaked preload into compositor children");
+      require_fallback();
+      require(lookups == 0 && enumerations == 0, "native KMS allocation inspected other GPUs");
+      auto *physical = gbm_create_device(nvidia_one.fd);
+      require(physical->fd == nvidia_one.fd, "native physical allocator changed");
+      gbm_device_destroy(physical);
+      require(fcntl(nvidia_one.fd, F_GETFD) >= 0, "native path closed physical caller fd");
+    });
+    run("native allocator wins when a compatibility legacy symbol remains", [&] {
+      legacy_allocator_symbol = native_allocator_symbol = true;
+      configure_allocator_routing(lookup_allocator);
+      require(!hooks_enabled, "legacy compatibility symbol bypassed native allocator guard");
+      require_fallback();
+    });
+    run("unknown KWin allocator ABI preserves native allocation", [&] {
+      configure_allocator_routing(lookup_allocator);
+      require(!hooks_enabled, "unrecognized KWin ABI enabled allocator substitution");
+      require_fallback();
     });
     run("single NVIDIA association works with an unrelated Virtio console", [&] {
       require_routed(gbm_create_device(virtual_kms.fd), nvidia_one);
