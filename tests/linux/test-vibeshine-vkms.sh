@@ -89,6 +89,28 @@ configure_lease_paths "$TEST_ROOT/vkms-leases"
 # shellcheck disable=SC2034
 FAKE_CONFIGFS=1
 
+[[ $VKMS_OUTPUT_COUNT -eq 8 ]] || fail "new pools must support eight client identities"
+configfs_is_mounted() { return 0; }
+OWNER_UID=11001
+OTHER_UID=11002
+
+# Upgrading the helper must not unplug a legacy pool or steal its live leases.
+VKMS_OUTPUT_COUNT=4
+create_pool || fail "legacy pool fixture creation failed"
+response=$(printf 'connect Virtual-4\n' | control_connection "$OWNER_UID") || fail "legacy ownership fixture failed"
+VKMS_OUTPUT_COUNT=8
+create_pool || fail "legacy pool upgrade validation failed"
+status_pool || fail "retained legacy pool was reported unavailable"
+assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-4/status" "$CONNECTOR_STATUS_CONNECTED"
+assert_file_value "$LEASE_ROOT/Virtual-4.owner" "$OWNER_UID"
+[[ ! -e "$VKMS_DEVICE_DIR/connectors/Virtual-5" ]] || fail "upgrade mutated the live legacy pool"
+if response=$(printf 'connect Virtual-6\n' | control_connection "$OWNER_UID"); then
+  fail "legacy pool advertised an unprovisioned output"
+fi
+[[ "$response" == "ERROR invalid connector" ]] || fail "unexpected legacy-capacity rejection: $response"
+remove_pool || fail "safe legacy fixture removal failed"
+[[ ! -e "$LEASE_ROOT/Virtual-4.owner" ]] || fail "legacy removal left an ownership lease"
+
 ensure_display_backend || fail "preferred backend selection failed"
 create_pool || fail "initial pool creation failed"
 assert_file_value "$VKMS_DEVICE_DIR/enabled" 1
@@ -143,7 +165,7 @@ assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-2/status" "$CONNECTOR_STA
 assert_file_value "$LEASE_PATH" "$OWNER_UID"
 validate_topology || fail "live connected topology was rejected"
 
-# A second start must retain the exact four-pipeline object graph and must not
+# A second start must retain the exact eight-pipeline object graph and must not
 # reset a live connector back to dormant.
 create_pool || fail "idempotent pool creation failed"
 assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-2/status" "$CONNECTOR_STATUS_CONNECTED"
@@ -153,7 +175,7 @@ for group in planes crtcs encoders connectors; do
     [[ -e "$entry" || -L "$entry" ]] || continue
     ((count += 1))
   done
-  [[ $count -eq $VKMS_OUTPUT_COUNT ]] || fail "${group}: expected 4 items after restart, found ${count}"
+  [[ $count -eq $VKMS_OUTPUT_COUNT ]] || fail "${group}: expected ${VKMS_OUTPUT_COUNT} items after restart, found ${count}"
 done
 
 response=$(printf 'disconnect Virtual-2\n' | control_connection 0) || fail "root handoff disconnect failed"
@@ -187,15 +209,23 @@ if response=$(printf 'status Virtual-2\n' | control_connection); then
 fi
 [[ "$response" == "ERROR peer credentials unavailable" ]] || fail "unexpected missing-peer response: ${response}"
 
-for invalid_request in 'connect Virtual-0' 'connect Virtual-5' 'connect Virtual-1 extra' 'CONNECT Virtual-1'; do
+for invalid_request in 'connect Virtual-0' 'connect Virtual-01' 'status Virtual-8 extra' 'connect Virtual-1 extra' 'CONNECT Virtual-1'; do
   if response=$(printf '%s\n' "$invalid_request" | control_connection "$OWNER_UID"); then
     fail "invalid control request succeeded: ${invalid_request}"
   fi
   [[ "$response" == "ERROR malformed request" ]] || fail "unexpected protocol error: ${response}"
 done
 
+for unmapped_connector in Virtual-9 Virtual-10; do
+  if response=$(printf 'connect %s\n' "$unmapped_connector" | control_connection "$OWNER_UID"); then
+    fail "unmapped public connector unexpectedly resolved: $unmapped_connector"
+  fi
+  [[ "$response" == "ERROR invalid connector" ]] || fail "unexpected unmapped connector response: ${response}"
+done
+
 for invalid_mode in \
   'mode Virtual-0 3024 1890 90000' \
+  'mode Virtual-9 3024 1890 90000' \
   'mode Virtual-2 63 1890 90000' \
   'mode Virtual-2 3024 1890 0' \
   'mode Virtual-2 3024 1890 1000001'; do
@@ -209,6 +239,85 @@ if response=$(printf '%s\n' "$oversized_request" | control_connection "$OWNER_UI
   fail 'oversized control request succeeded'
 fi
 [[ "$response" == "ERROR request too large" ]] || fail "unexpected oversized-request response: ${response}"
+
+# Expanded connectors have the same peer ownership, mode and release policy.
+for connector in Virtual-5 Virtual-6 Virtual-7 Virtual-8; do
+  response=$(printf 'connect %s\n' "$connector" | control_connection "$OWNER_UID") || fail "expanded connector acquisition failed: $connector"
+  [[ "$response" == "OK connected $connector" ]] || fail "unexpected expanded connect response"
+  assert_file_value "$LEASE_ROOT/$connector.owner" "$OWNER_UID"
+  response=$(printf 'mode %s 2560 1440 120000\n' "$connector" | control_connection "$OWNER_UID") || fail "expanded connector mode request failed"
+  assert_file_value "$VKMS_DEVICE_DIR/connectors/$connector/requested_mode" "2560 1440 120000"
+  if response=$(printf 'disconnect %s\n' "$connector" | control_connection "$OTHER_UID"); then
+    fail "expanded connector accepted cross-uid disconnect"
+  fi
+  [[ "$response" == "ERROR connector owned by another uid" ]] || fail "expanded lease was not protected"
+  if response=$(printf 'mode %s 1920 1080 60000\n' "$connector" | control_connection "$OTHER_UID"); then
+    fail "expanded connector accepted cross-uid mode"
+  fi
+  assert_file_value "$VKMS_DEVICE_DIR/connectors/$connector/requested_mode" "2560 1440 120000"
+  response=$(printf 'status %s\n' "$connector" | control_connection "$OTHER_UID") || fail "expanded status request failed"
+  [[ "$response" == "STATUS connected $connector" ]] || fail "expanded connector was not reported connected"
+  response=$(printf 'disconnect %s\n' "$connector" | control_connection "$OWNER_UID") || fail "expanded owner release failed"
+  [[ ! -e "$LEASE_ROOT/$connector.owner" ]] || fail "expanded release retained a lease"
+done
+
+# Public DRM connector names can be globally offset by virtual connectors on
+# other DRM devices. Resolve them from the driver's read-only configfs mapping,
+# and keep all paths and ownership leases bounded to the managed pool slots.
+for ((slot = 1; slot <= VKMS_OUTPUT_COUNT; ++slot)); do
+  public_id=$((slot + 2))
+  if ((slot == 1)); then
+    public_id=2
+  fi
+  printf 'Virtual-%s\n' "$public_id" >"$VKMS_DEVICE_DIR/connectors/Virtual-${slot}/drm_name"
+done
+response=$(printf 'connect Virtual-2\n' | control_connection "$OWNER_UID") || fail "offset public connector failed to map"
+[[ "$response" == "OK connected Virtual-2" ]] || fail "broker did not echo public DRM name"
+assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-1/status" "$CONNECTOR_STATUS_CONNECTED"
+assert_file_value "$LEASE_ROOT/Virtual-1.owner" "$OWNER_UID"
+[[ ! -e "$LEASE_ROOT/Virtual-2.owner" ]] || fail "lease used public name instead of resolved pool slot"
+response=$(printf 'mode Virtual-2 3024 1890 90000\n' | control_connection "$OWNER_UID") || fail "offset public mode request failed"
+[[ "$response" == "OK mode Virtual-2 3024 1890 90000" ]] || fail "mode reply did not echo public DRM name"
+assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-1/requested_mode" "3024 1890 90000"
+response=$(printf 'status Virtual-2\n' | control_connection "$OTHER_UID") || fail "offset public status request failed"
+[[ "$response" == "STATUS connected Virtual-2" ]] || fail "status reply did not echo public DRM name"
+response=$(printf 'disconnect Virtual-2\n' | control_connection "$OWNER_UID") || fail "offset public release failed"
+[[ "$response" == "OK disconnected Virtual-2" ]] || fail "disconnect reply did not echo public DRM name"
+[[ ! -e "$LEASE_ROOT/Virtual-1.owner" ]] || fail "resolved logical-slot lease remained after disconnect"
+if response=$(printf 'connect Virtual-1\n' | control_connection "$OWNER_UID"); then
+  fail "unmapped Virtual-1 fell back to a same-name logical slot"
+fi
+[[ "$response" == "ERROR invalid connector" ]] || fail "unexpected unmapped Virtual-1 response"
+if response=$(printf 'connect Virtual-3\n' | control_connection "$OWNER_UID"); then
+  fail "noncontiguous mapping accepted an absent public DRM name"
+fi
+[[ "$response" == "ERROR invalid connector" ]] || fail "unexpected noncontiguous mapping response"
+response=$(printf 'connect Virtual-10\n' | control_connection "$OWNER_UID") || fail "highest offset pool name did not map"
+[[ "$response" == "OK connected Virtual-10" ]] || fail "highest offset response was not preserved"
+assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-8/status" "$CONNECTOR_STATUS_CONNECTED"
+assert_file_value "$LEASE_ROOT/Virtual-8.owner" "$OWNER_UID"
+response=$(printf 'mode Virtual-10 2560 1440 120000\n' | control_connection "$OWNER_UID") || fail "highest offset mode request failed"
+assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-8/requested_mode" "2560 1440 120000"
+response=$(printf 'disconnect Virtual-10\n' | control_connection "$OWNER_UID") || fail "highest offset release failed"
+
+# Missing mapping data (including an older loaded driver) and duplicate DRM
+# names must fail closed without touching any connector or lease.
+mv -- "$VKMS_DEVICE_DIR/connectors/Virtual-8/drm_name" "$TEST_ROOT/Virtual-8.drm_name"
+if response=$(printf 'connect Virtual-2\n' | control_connection "$OWNER_UID"); then
+  fail "control continued with an incomplete DRM-name mapping"
+fi
+[[ "$response" == "ERROR invalid connector" ]] || fail "unexpected missing-mapping response"
+mv -- "$TEST_ROOT/Virtual-8.drm_name" "$VKMS_DEVICE_DIR/connectors/Virtual-8/drm_name"
+printf 'Virtual-2\n' >"$VKMS_DEVICE_DIR/connectors/Virtual-2/drm_name"
+if response=$(printf 'connect Virtual-2\n' | control_connection "$OWNER_UID"); then
+  fail "control accepted a duplicate DRM-name mapping"
+fi
+[[ "$response" == "ERROR invalid connector" ]] || fail "unexpected duplicate-mapping response"
+assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-1/status" "$CONNECTOR_STATUS_DISCONNECTED"
+[[ ! -e "$LEASE_ROOT/Virtual-1.owner" ]] || fail "ambiguous mapping created a lease"
+for ((slot = 1; slot <= VKMS_OUTPUT_COUNT; ++slot)); do
+  printf 'Virtual-%s\n' "$slot" >"$VKMS_DEVICE_DIR/connectors/Virtual-${slot}/drm_name"
+done
 
 # Control must never follow a connector attribute symlink in the test model.
 mv -- "$VKMS_DEVICE_DIR/connectors/Virtual-3/status" "$TEST_ROOT/Virtual-3.status"

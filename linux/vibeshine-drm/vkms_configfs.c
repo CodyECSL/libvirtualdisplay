@@ -565,6 +565,25 @@ static ssize_t connector_status_store(struct config_item *item,
 
 CONFIGFS_ATTR(connector_, status);
 
+/* DRM's VIRTUAL connector type IDs are global, while configfs names are pool-local.
+ * Publish the instantiated connector name so the broker can translate safely. */
+static ssize_t connector_drm_name_show(struct config_item *item, char *page)
+{
+	struct vkms_configfs_connector *connector;
+	ssize_t length;
+
+	connector = connector_item_to_vkms_configfs_connector(item);
+	scoped_guard(mutex, &connector->dev->lock) {
+		if (!connector->dev->enabled || !connector->config->connector)
+			return -ENODEV;
+		length = sysfs_emit(page, "%s\n",
+				    connector->config->connector->base.name);
+	}
+	return length;
+}
+
+CONFIGFS_ATTR_RO(connector_, drm_name);
+
 static ssize_t connector_requested_mode_show(struct config_item *item, char *page)
 {
 	struct vkms_configfs_connector *connector;
@@ -604,6 +623,7 @@ CONFIGFS_ATTR(connector_, requested_mode);
 
 static struct configfs_attribute *connector_item_attrs[] = {
 	&connector_attr_status,
+	&connector_attr_drm_name,
 	&connector_attr_requested_mode,
 	NULL,
 };

@@ -297,6 +297,24 @@ namespace virtual_display::driver {
     base[33] = std::byte {0x50};
     base[34] = std::byte {0x54};
 
+    if (safe_options.hdr_supported) {
+      // This virtual display transports HDR10, rather than modelling a physical
+      // panel. Advertise BT.2020/D65 so applications do not clip wide-gamut
+      // content to the SDR primaries above before capture. The client display
+      // handles its own gamut mapping; guessing P3 here would still limit it.
+      // Coordinates are Rx, Ry, Gx, Gy, Bx, By, Wx, Wy (ITU-R BT.2020).
+      constexpr std::array<double, 8> chromaticities {
+        0.708, 0.292, 0.170, 0.797, 0.131, 0.046, 0.3127, 0.3290
+      };
+      base[25] = std::byte {0};
+      base[26] = std::byte {0};
+      for (std::size_t index = 0; index < chromaticities.size(); ++index) {
+        const auto coordinate = static_cast<std::uint16_t>(chromaticities[index] * 1024.0 + 0.5);
+        base[27 + index] = byte(coordinate >> 2u);
+        base[25 + index / 4] |= byte((coordinate & 3u) << (6u - 2u * (index % 4)));
+      }
+    }
+
     std::fill(base.begin() + 38, base.begin() + 54, std::byte {0x01});
     write_detailed_timing(base, 54, safe_options);
     write_text_descriptor(base, 72, std::byte {0xff}, std::to_string(safe_options.serial_number));
