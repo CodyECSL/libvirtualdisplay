@@ -26,6 +26,7 @@ namespace {
   using gbm_device_destroy_fn = void (*)(gbm_device *);
   using drm_get_devices2_fn = int (*)(std::uint32_t, drmDevicePtr[], int);
   using drm_get_device2_fn = int (*)(int, std::uint32_t, drmDevicePtr *);
+  using drm_devices_equal_fn = int (*)(drmDevicePtr, drmDevicePtr);
 
   constexpr std::string_view kRenderPciEnvironment = "VIBESHINE_KWIN_RENDER_PCI";
   constexpr std::string_view kPreloadActiveEnvironment = "VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE";
@@ -34,11 +35,23 @@ namespace {
   std::atomic<gbm_device_destroy_fn> real_gbm_device_destroy {nullptr};
   std::atomic<drm_get_devices2_fn> real_drm_get_devices2 {nullptr};
   std::atomic<drm_get_device2_fn> real_drm_get_device2 {nullptr};
+  std::atomic<drm_devices_equal_fn> real_drm_devices_equal {nullptr};
   std::atomic<bool> gpu_attachment_logged {false};
   std::atomic<bool> ambiguous_gpu_logged {false};
   // The secure-mode loader trusts this library in any set-user-ID program.
   // Only the actual KWin compositor may route a virtual device's GBM allocator.
   std::atomic<bool> hooks_enabled {false};
+  // KWin 6.8 maps each KMS device to a render device by DRM device identity.
+  // Without a pairing, the faux KMS device gets a software renderer and every
+  // frame is read back through the CPU into a dumb buffer.
+  std::atomic<bool> render_device_aliasing {false};
+  // libdrm's drmGetDevices2() compares devices through its own PLT entry for
+  // drmDevicesEqual(), which lands in our hook. Set while the bridge enumerates.
+  thread_local bool enumerating_devices = false;
+  struct enumeration_scope {
+    enumeration_scope() { enumerating_devices = true; }
+    ~enumeration_scope() { enumerating_devices = false; }
+  };
   std::mutex render_fds_mutex;
   std::unordered_map<gbm_device *, int> owned_render_fds;
 
@@ -135,12 +148,36 @@ namespace {
     return !configured && matches > 0 ? selected : nullptr;
   }
 
+  std::optional<drmPciBusInfo> selected_render_identity() {
+    const auto enumerate = resolve_real_function(real_drm_get_devices2, "drmGetDevices2");
+    if (!enumerate) {
+      return std::nullopt;
+    }
+    const enumeration_scope scope;
+    const int count = enumerate(0, nullptr, 0);
+    if (count <= 0) {
+      return std::nullopt;
+    }
+    std::vector<drmDevicePtr> devices(static_cast<std::size_t>(count), nullptr);
+    const int actual_count = std::min(enumerate(0, devices.data(), count), count);
+    if (actual_count <= 0) {
+      return std::nullopt;
+    }
+    std::optional<drmPciBusInfo> identity;
+    if (const auto selected = select_render_device(devices.data(), actual_count)) {
+      identity = *selected->businfo.pci;
+    }
+    drmFreeDevices(devices.data(), actual_count);
+    return identity;
+  }
+
   int open_render_device(drmPciBusInfo &identity) {
     const auto enumerate = resolve_real_function(real_drm_get_devices2, "drmGetDevices2");
     const auto get_device = resolve_real_function(real_drm_get_device2, "drmGetDevice2");
     if (!enumerate || !get_device) {
       return -1;
     }
+    const enumeration_scope scope;
     const int count = enumerate(0, nullptr, 0);
     if (count <= 0) {
       return -1;
@@ -202,13 +239,16 @@ namespace {
   }
 
   /**
-   * @brief Enable render-node substitution only for KWin's legacy allocator.
+   * @brief Choose how the virtual device reaches the NVIDIA renderer.
    *
-   * KWin 6.8 separates rendering from scanout and sends software scanout
-   * allocations through gbm_device_get_fd(). Replacing that KMS device with
-   * an NVIDIA render node makes CREATE_DUMB fail in drm_ioctl_permit().
-   * Detect the exported allocator ABI rather than a package/version string;
-   * unknown ABIs also retain the compositor's native allocation path.
+   * The legacy allocator takes a gbm_device and needs only the render-node
+   * substitution. KWin 6.8 separates rendering from scanout: it sends software
+   * scanout allocations through gbm_device_get_fd(), where a render node makes
+   * CREATE_DUMB fail in drm_ioctl_permit(), and it only allocates scanout on
+   * the GPU when GpuManager pairs the KMS device with the rendering device.
+   * Enable the render node together with that pairing, so scanout never takes
+   * the dumb-buffer path. An unknown ABI keeps the compositor's native
+   * allocation. Detect exported symbols rather than a package/version string.
    *
    * @param lookup Dynamic symbol lookup, injectable for routing tests.
    */
@@ -217,11 +257,16 @@ namespace {
       "_ZN4KWin26GbmGraphicsBufferAllocatorC1EP10gbm_devicem") != nullptr;
     const bool native_allocator = lookup(RTLD_DEFAULT,
       "_ZN4KWin26GbmGraphicsBufferAllocatorC1EPNS_9DrmDeviceE") != nullptr;
-    hooks_enabled.store(legacy_allocator && !native_allocator, std::memory_order_release);
+    const bool render_device_matching = lookup(RTLD_DEFAULT,
+      "_ZNK4KWin10GpuManager22compatibleRenderDeviceEPNS_9DrmDeviceE") != nullptr;
+    const bool legacy_routing = legacy_allocator && !native_allocator;
+    const bool paired_routing = native_allocator && render_device_matching;
+    render_device_aliasing.store(paired_routing, std::memory_order_release);
+    hooks_enabled.store(legacy_routing || paired_routing, std::memory_order_release);
     // Always clear the preload, including when the native KMS allocator wins.
     (void)unsetenv("LD_PRELOAD");
     (void)unsetenv(kPreloadActiveEnvironment.data());
-    if (!legacy_allocator || native_allocator) {
+    if (!legacy_routing && !paired_routing) {
       constexpr char message[] =
         "[vibeshine-kwin-gpu] preserving native KMS allocator for current KWin ABI\n";
       (void)write(STDERR_FILENO, message, sizeof(message) - 1);
@@ -279,6 +324,35 @@ extern "C" gbm_device *gbm_create_device(const int fd) {
   return allocator;
 }
 
+/**
+ * @brief Pair the virtual KMS device with the selected NVIDIA renderer.
+ *
+ * Only this one answer changes. Device records, PCI identities and node lists
+ * are left untouched, so other graphics consumers keep seeing the true seat.
+ */
+extern "C" int drmDevicesEqual(drmDevicePtr left, drmDevicePtr right) {
+  const auto function = resolve_real_function(real_drm_devices_equal, "drmDevicesEqual");
+  if (!function) {
+    errno = ENOSYS;
+    return 0;
+  }
+  const int equal = function(left, right);
+  if (equal == 1 || enumerating_devices ||
+      !render_device_aliasing.load(std::memory_order_acquire)) {
+    return equal;
+  }
+  const bool left_virtual = is_vibeshine_display(left);
+  if (left_virtual == is_vibeshine_display(right)) {
+    return equal;
+  }
+  const auto other = left_virtual ? right : left;
+  if (!is_nvidia_render_device(other)) {
+    return equal;
+  }
+  const auto identity = selected_render_identity();
+  return identity && pci_matches(*other->businfo.pci, *identity) ? 1 : equal;
+}
+
 extern "C" void gbm_device_destroy(gbm_device *device) {
   const auto function = resolve_real_function(real_gbm_device_destroy, "gbm_device_destroy");
   if (!function) {
@@ -306,5 +380,5 @@ extern "C" void gbm_device_destroy(gbm_device *device) {
 }
 
 extern "C" unsigned int vibeshine_kwin_gpu_interposer_abi() {
-  return 5;
+  return 6;
 }

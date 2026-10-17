@@ -15,12 +15,28 @@ NVIDIA PCI device to unrelated GBM/EGL consumers inside the compositor.
 KWin 6.8 separates render allocation from KMS scanout allocation. Its software
 scanout path calls `CREATE_DUMB` on `gbm_device_get_fd()`, which must remain the
 virtual KMS fd: Linux rejects this ioctl on an NVIDIA render node with `EACCES`.
-The bridge recognizes the exported `DrmDevice *` allocator constructor and
-preserves native allocation for that ABI and for unrecognized ABIs. It still
-removes the preload environment before compositor children start. Physical
-GPU allocators and DRM permissions are unchanged. A running compositor must
-restart through the normal logout/reboot cycle to load an updated bridge;
+That path is also a per-frame CPU readback (`glReadPixels` into a dumb buffer),
+which caps throughput near 270 Mpix/s. KWin 6.8 takes it whenever
+`GpuManager::compatibleRenderDevice()` gives the faux KMS device a software
+renderer, because that lookup pairs devices with `drmDevicesEqual()` and the
+faux device never equals an NVIDIA PCI device.
+
+When the compositor exports both the `DrmDevice *` allocator constructor and
+`GpuManager::compatibleRenderDevice(DrmDevice *)`, the bridge therefore does two
+things together: it opens the GBM allocator of the virtual device on the selected
+NVIDIA render node, and it makes `drmDevicesEqual()` answer 1 for the pair
+(Vibeshine faux device, selected NVIDIA device). KWin then renders and scans out
+on the GPU with the block-linear modifiers the virtual plane advertises. Only
+that one answer changes; device records, PCI identities and enumeration order do
+not. Other KWin ABIs, and unrecognized ones, preserve native allocation. The
+bridge removes the preload environment before compositor children start.
+Physical GPU allocators and DRM permissions are unchanged. A running compositor
+must restart through the normal logout/reboot cycle to load an updated bridge;
 restarting the streaming service does not replace its already loaded library.
+
+If KWin does not use the selected GPU as its primary renderer (for example on a
+multi-GPU host), it can still fall back to the dumb-buffer path.
+`VIBESHINE_KWIN_RENDER_PCI` should then name KWin's primary GPU.
 
 KWin still chooses its primary GPU using its own renderer/output policy;
 accelerating the faux renderer can change that choice.

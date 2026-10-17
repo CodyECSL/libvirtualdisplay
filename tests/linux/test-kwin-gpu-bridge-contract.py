@@ -46,11 +46,13 @@ def main() -> int:
         "matches > 1",
         "VIBESHINE_KWIN_RENDER_PCI",
         "vibeshine_kwin_gpu_interposer_abi",
-        "return 5",
+        "return 6",
         "stop_kwin_preload_inheritance",
         "running_inside_kwin",
         "configure_allocator_routing(dlsym)",
-        "hooks_enabled.store(legacy_allocator && !native_allocator",
+        "hooks_enabled.store(legacy_routing || paired_routing",
+        "_ZNK4KWin10GpuManager22compatibleRenderDeviceEPNS_9DrmDeviceE",
+        'extern "C" int drmDevicesEqual',
         "_ZN4KWin26GbmGraphicsBufferAllocatorC1EP10gbm_devicem",
         "_ZN4KWin26GbmGraphicsBufferAllocatorC1EPNS_9DrmDeviceE",
         'readlink("/proc/self/exe"',
@@ -59,6 +61,8 @@ def main() -> int:
     ), interposer_path.name)
     require('extern "C" int drmGet' not in interposer,
             "bridge must not rewrite libdrm device identities")
+    require("render_device_aliasing.load(std::memory_order_acquire)" in interposer,
+            "render-device pairing must stay gated to the KWin 6.8 compositor")
     require("bustype = DRM_BUS_PCI" not in interposer,
             "virtual KMS PCI spoofing returned")
     require_all(interposer, (

@@ -77,6 +77,13 @@ namespace {
   bool reject_render_type;
   bool legacy_allocator_symbol;
   bool native_allocator_symbol;
+  bool gpu_manager_symbol;
+  int equal_calls;
+
+  int devices_equal(drmDevicePtr left, drmDevicePtr right) {
+    ++equal_calls;
+    return left == right ? 1 : 0;
+  }
 
   void *lookup_allocator(void *scope, const char *name) {
     require(scope == RTLD_DEFAULT, "allocator lookup used a different symbol scope");
@@ -87,11 +94,21 @@ namespace {
     if (std::strcmp(name, "_ZN4KWin26GbmGraphicsBufferAllocatorC1EPNS_9DrmDeviceE") == 0) {
       return native_allocator_symbol ? &symbol : nullptr;
     }
+    if (std::strcmp(name, "_ZNK4KWin10GpuManager22compatibleRenderDeviceEPNS_9DrmDeviceE") == 0) {
+      return gpu_manager_symbol ? &symbol : nullptr;
+    }
     throw std::runtime_error("unexpected KWin ABI lookup");
   }
 
+  bool enumeration_compares_devices;
+
   int get_devices(std::uint32_t, drmDevicePtr devices[], int capacity) {
     ++enumerations;
+    if (enumeration_compares_devices && devices && !native_devices.empty()) {
+      // libdrm's drmGetDevices2 compares devices through its own PLT entry.
+      require(enumerations < 4, "device enumeration recursed through drmDevicesEqual");
+      (void)drmDevicesEqual(&virtual_device->record, &native_devices.back()->record);
+    }
     if (!devices) {
       return static_cast<int>(native_devices.size());
     }
@@ -139,6 +156,10 @@ namespace {
     real_gbm_device_destroy = destroy_device;
     real_drm_get_devices2 = get_devices;
     real_drm_get_device2 = get_device;
+    real_drm_devices_equal = devices_equal;
+    render_device_aliasing = false;
+    enumeration_compares_devices = false;
+    equal_calls = 0;
     gpu_attachment_logged = false;
     ambiguous_gpu_logged = false;
     created_fds.clear();
@@ -147,7 +168,7 @@ namespace {
     last_node_fd = -1;
     renumbered_device = nullptr;
     reject_render_gbm = reject_render_type = false;
-    legacy_allocator_symbol = native_allocator_symbol = false;
+    legacy_allocator_symbol = native_allocator_symbol = gpu_manager_symbol = false;
     unsetenv("VIBESHINE_KWIN_RENDER_PCI");
   }
 
@@ -359,7 +380,78 @@ int main() {
       native_devices = {&virtual_kms, &virtio};
       require_fallback();
     });
-    require(vibeshine_kwin_gpu_interposer_abi() == 5, "unexpected bridge ABI");
+    run("KWin 6.8 render-device matching routes scanout to NVIDIA and aliases the virtual GPU", [&] {
+      native_allocator_symbol = gpu_manager_symbol = true;
+      setenv("VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE", "1", 1);
+      setenv("LD_PRELOAD", "libvibeshine-kwin-gpu.so", 1);
+      configure_allocator_routing(lookup_allocator);
+      require(hooks_enabled && render_device_aliasing,
+        "KWin 6.8 render-device matching did not enable GPU association");
+      require(!std::getenv("LD_PRELOAD") && !std::getenv("VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE"),
+        "render-device matching path leaked preload into compositor children");
+      require_routed(gbm_create_device(virtual_kms.fd), nvidia_one);
+    });
+    run("native allocator without render-device matching keeps the aliasing hook off", [&] {
+      native_allocator_symbol = true;
+      configure_allocator_routing(lookup_allocator);
+      require(!hooks_enabled && !render_device_aliasing, "unknown KWin enabled GPU association");
+    });
+    run("legacy allocator never enables render-device aliasing", [&] {
+      legacy_allocator_symbol = gpu_manager_symbol = true;
+      configure_allocator_routing(lookup_allocator);
+      require(hooks_enabled && !render_device_aliasing, "legacy KWin enabled render-device aliasing");
+    });
+    run("virtual KMS matches only the selected NVIDIA device for KWin render-device lookup", [&] {
+      native_devices = {&nvidia_two, &virtio, &virtual_kms, &nvidia_one};
+      render_device_aliasing = true;
+      require(drmDevicesEqual(&virtual_kms.record, &nvidia_one.record) == 1 &&
+        drmDevicesEqual(&nvidia_one.record, &virtual_kms.record) == 1,
+        "virtual KMS was not paired with the selected NVIDIA renderer");
+      require(drmDevicesEqual(&virtual_kms.record, &nvidia_two.record) == 0,
+        "virtual KMS was paired with a non-selected NVIDIA renderer");
+      require(drmDevicesEqual(&virtual_kms.record, &virtio.record) == 0,
+        "virtual KMS was paired with the Virtio console");
+      require(drmDevicesEqual(&nvidia_one.record, &nvidia_two.record) == 0,
+        "physical GPUs were paired with each other");
+      require(drmDevicesEqual(&unrelated_faux.record, &nvidia_one.record) == 0,
+        "unrelated faux device was paired with NVIDIA");
+      require(drmDevicesEqual(&nvidia_one.record, &nvidia_one.record) == 1,
+        "identical devices stopped matching");
+      require_original_devices();
+    });
+    run("libdrm enumeration calling drmDevicesEqual does not recurse", [&] {
+      native_devices = {&virtual_kms, &virtio, &nvidia_one};
+      enumeration_compares_devices = true;
+      render_device_aliasing = true;
+      require(drmDevicesEqual(&virtual_kms.record, &nvidia_one.record) == 1,
+        "pairing failed when enumeration compares devices");
+      require(enumerations == 2, "pairing enumerated more than once (count plus fill)");
+    });
+    run("explicit PCI selection also selects the render-device pairing", [&] {
+      native_devices = {&nvidia_one, &virtual_kms, &nvidia_two};
+      setenv("VIBESHINE_KWIN_RENDER_PCI", "0000:02:00.0", 1);
+      render_device_aliasing = true;
+      require(drmDevicesEqual(&virtual_kms.record, &nvidia_two.record) == 1 &&
+        drmDevicesEqual(&virtual_kms.record, &nvidia_one.record) == 0,
+        "pairing ignored the explicit PCI choice");
+    });
+    run("an unmatched explicit PCI choice leaves the render-device lookup unpaired", [&] {
+      setenv("VIBESHINE_KWIN_RENDER_PCI", "0000:03:00.0", 1);
+      render_device_aliasing = true;
+      require(drmDevicesEqual(&virtual_kms.record, &nvidia_one.record) == 0,
+        "unmatched explicit choice still paired the virtual GPU");
+    });
+    run("render-device pairing is inert when aliasing is disabled", [&] {
+      require(drmDevicesEqual(&virtual_kms.record, &nvidia_one.record) == 0 &&
+        enumerations == 0, "disabled aliasing inspected or paired devices");
+    });
+    run("no NVIDIA renderer leaves the render-device lookup unpaired", [&] {
+      native_devices = {&virtual_kms, &virtio};
+      render_device_aliasing = true;
+      require(drmDevicesEqual(&virtual_kms.record, &virtio.record) == 0,
+        "virtual GPU paired without an NVIDIA renderer");
+    });
+    require(vibeshine_kwin_gpu_interposer_abi() == 6, "unexpected bridge ABI");
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL: " << error.what() << '\n';
